@@ -33,6 +33,7 @@ jobs:
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_PRIVATE_KEY }}
           script: |
-            pkill -f 'java' || true # 기존 애플리케이션 종료
-            scp -o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null" /github/workspace/build/libs/spring-app.jar /home/ec2-user/
-            nohup java -jar /home/ec2-user/spring-app.jar > app.log 2>&1 &
+            pkill -f 'java' || true
+            mkdir -p /home/${{ secrets.EC2_USERNAME }}
+            cd /home/${{ secrets.EC2_USERNAME }}
+            nohup java -jar spring-app.jar > app.log 2>&1 &
