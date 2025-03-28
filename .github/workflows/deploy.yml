@@ -23,17 +23,29 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Build with Gradle
-        run: |
-          ./gradlew clean build
+        run: ./gradlew clean build
 
-      - name: Deploy to EC2 via SSH
+      - name: Copy JAR file to remote server
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          source: "build/libs/*.jar"
+          target: "/home/${{ secrets.USERNAME }}"
+          strip_components: 2
+
+      - name: Deploy application
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          key: ${{ secrets.EC2_PRIVATE_KEY }}
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
           script: |
             pkill -f 'java' || true
-            mkdir -p /home/${{ secrets.EC2_USERNAME }}
-            cd /home/${{ secrets.EC2_USERNAME }}
+            mkdir -p /home/${{ secrets.USERNAME }}
+            cd /home/${{ secrets.USERNAME }}
+            mv *.jar spring-app.jar
             nohup java -jar spring-app.jar > app.log 2>&1 &
