@@ -26,10 +26,12 @@ jobs:
 
       - name: Prepare SSH Key
         run: |
-          # 키 디코딩 무결성 검증 추가
+          # Base64로 인코딩된 키 디코딩 및 무결성 검증
           echo "${{ secrets.SSH_KEY }}" | base64 -d > deploy-key.pem
           ssh-keygen -y -f deploy-key.pem >/dev/null  # 키 유효성 검증
-          chmod 600 deploy-key.pem
+          chmod 600 deploy-key.pem  # 권한 설정 (600 필수)
+          
+          # SSH 디렉토리 및 known_hosts 설정
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
@@ -38,17 +40,16 @@ jobs:
       - name: Transfer JAR via SCP
         run: |
           scp -i deploy-key.pem \
-              -o ConnectTimeout=30 \
-              -o LogLevel=ERROR \
+              -o StrictHostKeyChecking=no \
               build/libs/spring-app.jar \
               ${{ secrets.USERNAME }}@${{ secrets.HOST }}:/home/${{ secrets.USERNAME }}/deploy/
 
       - name: Deploy Application
         run: |
           ssh -i deploy-key.pem \
-              -o ConnectTimeout=30 \
-              -o LogLevel=ERROR \
+              -o StrictHostKeyChecking=no \
               ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
+          
           set -e  # 에러 발생 시 즉시 종료
 
           DEPLOY_DIR="/home/${{ secrets.USERNAME }}/deploy"
@@ -60,18 +61,18 @@ jobs:
             if [ -n "$CURRENT_PID" ]; then
               kill -15 $CURRENT_PID
               echo "Sending SIGTERM to PID: $CURRENT_PID"
-              timeout 30 tail --pid=$CURRENT_PID -f /dev/null  # 최대 30초 대기
+              timeout 30 tail --pid=$CURRENT_PID -f /dev/null || true  # 최대 30초 대기
             fi
           fi
 
-          # 이중 실행 방지
+          # 이중 실행 방지 및 로그 백업
           pkill -9 -f spring-app.jar || true
-
-          # 로그 백업 및 신규 배포
           mv "$LOG_FILE" "$LOG_FILE.bak" 2>/dev/null || true
+
+          # 새 버전 배포
           nohup java -jar "$DEPLOY_DIR/spring-app.jar" > "$LOG_FILE" 2>&1 &
 
-          # 헬스 체크 강화
+          # 헬스 체크 강화 (최대 60초 대기)
           HEALTH_CHECK_TIMEOUT=60
           HEALTH_CHECK_INTERVAL=5
           ATTEMPTS=$((HEALTH_CHECK_TIMEOUT / HEALTH_CHECK_INTERVAL))
@@ -90,11 +91,12 @@ jobs:
             exit 1
           fi
 
-          # 로그 확인
+          # 로그 확인 (최근 50줄 출력)
           tail -n 50 "$LOG_FILE"
+          
           EOF
 
-      - name: Cleanup
+      - name: Cleanup SSH Key and Known Hosts
         run: |
           rm -f deploy-key.pem
-          rm -rf ~/.ssh
+          rm -rf ~/.ssh/
