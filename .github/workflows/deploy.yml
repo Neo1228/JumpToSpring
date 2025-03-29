@@ -26,46 +26,75 @@ jobs:
 
       - name: Prepare SSH Key
         run: |
-          # Base64로 인코딩된 키 디코딩
+          # 키 디코딩 무결성 검증 추가
           echo "${{ secrets.SSH_KEY }}" | base64 -d > deploy-key.pem
+          ssh-keygen -y -f deploy-key.pem >/dev/null  # 키 유효성 검증
           chmod 600 deploy-key.pem
-          # Known hosts 등록 (최초 연결 시 yes 입력 방지)
           mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
       - name: Transfer JAR via SCP
         run: |
           scp -i deploy-key.pem \
-              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=30 \
+              -o LogLevel=ERROR \
               build/libs/spring-app.jar \
               ${{ secrets.USERNAME }}@${{ secrets.HOST }}:/home/${{ secrets.USERNAME }}/deploy/
 
       - name: Deploy Application
         run: |
           ssh -i deploy-key.pem \
-              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=30 \
+              -o LogLevel=ERROR \
               ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
-          cd /home/${{ secrets.USERNAME }}/deploy
-          
-          # 기존 프로세스 그레이스풀 종료
-          CURRENT_PID=$(pgrep -f spring-app.jar)
-          if [ -n "$CURRENT_PID" ]; then
-            kill -15 $CURRENT_PID
-            sleep 10
+          set -e  # 에러 발생 시 즉시 종료
+
+          DEPLOY_DIR="/home/${{ secrets.USERNAME }}/deploy"
+          LOG_FILE="$DEPLOY_DIR/app.log"
+
+          # 기존 프로세스 안전 종료
+          if [ -f "$DEPLOY_DIR/spring-app.jar" ]; then
+            CURRENT_PID=$(pgrep -f spring-app.jar || echo "")
+            if [ -n "$CURRENT_PID" ]; then
+              kill -15 $CURRENT_PID
+              echo "Sending SIGTERM to PID: $CURRENT_PID"
+              timeout 30 tail --pid=$CURRENT_PID -f /dev/null  # 최대 30초 대기
+            fi
           fi
-          
-          # 이중 실행 방지를 위한 잔여 프로세스 제거
+
+          # 이중 실행 방지
           pkill -9 -f spring-app.jar || true
-          
-          # 새 버전 배포
-          nohup java -jar spring-app.jar > app.log 2>&1 &
-          
-          # 헬스 체크 (30초 타임아웃)
-          timeout 30 bash -c 'until curl -s http://localhost:8080/actuator/health; do sleep 2; done'
-          
-          # 로그 최근 50줄 출력
-          tail -n 50 app.log
+
+          # 로그 백업 및 신규 배포
+          mv "$LOG_FILE" "$LOG_FILE.bak" 2>/dev/null || true
+          nohup java -jar "$DEPLOY_DIR/spring-app.jar" > "$LOG_FILE" 2>&1 &
+
+          # 헬스 체크 강화
+          HEALTH_CHECK_TIMEOUT=60
+          HEALTH_CHECK_INTERVAL=5
+          ATTEMPTS=$((HEALTH_CHECK_TIMEOUT / HEALTH_CHECK_INTERVAL))
+
+          for ((i=1; i<=ATTEMPTS; i++)); do
+            if curl -sSf http://localhost:8080/actuator/health; then
+              echo "Health check passed!"
+              break
+            fi
+            sleep $HEALTH_CHECK_INTERVAL
+          done
+
+          if [ $i -gt $ATTEMPTS ]; then
+            echo "Health check failed after $HEALTH_CHECK_TIMEOUT seconds"
+            tail -n 100 "$LOG_FILE"
+            exit 1
+          fi
+
+          # 로그 확인
+          tail -n 50 "$LOG_FILE"
           EOF
 
       - name: Cleanup
-        run: rm -f deploy-key.pem
+        run: |
+          rm -f deploy-key.pem
+          rm -rf ~/.ssh
