@@ -1,4 +1,4 @@
-name: Deploy to EC2
+name: Manual Deploy to EC2
 
 on:
   push:
@@ -24,27 +24,48 @@ jobs:
           chmod +x ./gradlew
           ./gradlew clean build
 
-      - name: Copy JAR file to remote server
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          port: 22
-          source: "build/libs/spring-app.jar"
-          target: "/home/${{ secrets.USERNAME }}/deploy/"
-          rm: true
+      - name: Prepare SSH Key
+        run: |
+          # Base64로 인코딩된 키 디코딩
+          echo "${{ secrets.SSH_KEY }}" | base64 -d > deploy-key.pem
+          chmod 600 deploy-key.pem
+          # Known hosts 등록 (최초 연결 시 yes 입력 방지)
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
 
-      - name: Deploy application
-        uses: fifsky/ssh-action@master
-        with:
-          command: |
-            cd /home/${{ secrets.USERNAME }}/deploy
-            pkill -f 'spring-app.jar' || true
-            nohup java -jar spring-app.jar > app.log 2>&1 &
-            sleep 5
-            curl -s http://localhost:8080/actuator/health || exit 1
-          host: ${{ secrets.HOST }}
-          user: ${{ secrets.USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          port: 22
+      - name: Transfer JAR via SCP
+        run: |
+          scp -i deploy-key.pem \
+              -o StrictHostKeyChecking=no \
+              build/libs/spring-app.jar \
+              ${{ secrets.USERNAME }}@${{ secrets.HOST }}:/home/${{ secrets.USERNAME }}/deploy/
+
+      - name: Deploy Application
+        run: |
+          ssh -i deploy-key.pem \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
+          cd /home/${{ secrets.USERNAME }}/deploy
+          
+          # 기존 프로세스 그레이스풀 종료
+          CURRENT_PID=$(pgrep -f spring-app.jar)
+          if [ -n "$CURRENT_PID" ]; then
+            kill -15 $CURRENT_PID
+            sleep 10
+          fi
+          
+          # 이중 실행 방지를 위한 잔여 프로세스 제거
+          pkill -9 -f spring-app.jar || true
+          
+          # 새 버전 배포
+          nohup java -jar spring-app.jar > app.log 2>&1 &
+          
+          # 헬스 체크 (30초 타임아웃)
+          timeout 30 bash -c 'until curl -s http://localhost:8080/actuator/health; do sleep 2; done'
+          
+          # 로그 최근 50줄 출력
+          tail -n 50 app.log
+          EOF
+
+      - name: Cleanup
+        run: rm -f deploy-key.pem
