@@ -1,9 +1,13 @@
-name: Manual Deploy to EC2
+name: Secure EC2 Deployment with Debugging
 
 on:
   push:
     branches:
       - master
+
+env:
+  EC2_DEPLOY_DIR: /home/${{ secrets.USERNAME }}/deploy
+  EC2_LOG_FILE: app.log
 
 jobs:
   build-and-deploy:
@@ -13,7 +17,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Set up JDK 21
+      - name: Setup Java
         uses: actions/setup-java@v3
         with:
           distribution: 'temurin'
@@ -24,79 +28,82 @@ jobs:
           chmod +x ./gradlew
           ./gradlew clean build
 
-      - name: Prepare SSH Key
+      - name: Prepare SSH Environment
         run: |
-          # Base64로 인코딩된 키 디코딩 및 무결성 검증
-          echo "${{ secrets.SSH_KEY }}" | base64 -d > deploy-key.pem
-          ssh-keygen -y -f deploy-key.pem >/dev/null  # 키 유효성 검증
-          chmod 600 deploy-key.pem  # 권한 설정 (600 필수)
-          
-          # SSH 디렉토리 및 known_hosts 설정
+          # 절대 경로로 키 파일 저장 (중요!)
+          KEY_PATH="$HOME/ec2-deploy-key.pem"
+          echo "${{ secrets.SSH_KEY }}" | base64 -d > $KEY_PATH
+
+          # 권한 강제 설정 (600 미만 시 실패)
+          chmod 600 $KEY_PATH
+          if [ $(stat -c %a $KEY_PATH) -ne 600 ]; then
+            echo "::error::Key permissions invalid: $(stat -c %a $KEY_PATH)"
+            exit 1
+          fi
+
+          # 키 유효성 검증 (RSA 키 형식 확인)
+          ssh-keygen -y -f $KEY_PATH >/dev/null || (echo "::error::Invalid SSH key"; exit 1)
+
+          # SSH 설정
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Transfer JAR via SCP
+      - name: Debug Info
         run: |
-          scp -i deploy-key.pem \
-              -o StrictHostKeyChecking=no \
+          echo "### Current User ###"
+          whoami
+          echo "### Home Directory ###"
+          echo $HOME
+          echo "### Key File Permissions ###"
+          ls -l $HOME/ec2-deploy-key.pem
+          echo "### Java Version ###"
+          java -version
+
+      - name: Transfer JAR
+        run: |
+          scp -i $HOME/ec2-deploy-key.pem \
+              -o ConnectTimeout=30 \
+              -o LogLevel=DEBUG \
               build/libs/spring-app.jar \
-              ${{ secrets.USERNAME }}@${{ secrets.HOST }}:/home/${{ secrets.USERNAME }}/deploy/
+              ${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ env.EC2_DEPLOY_DIR }}/
 
       - name: Deploy Application
         run: |
-          ssh -i deploy-key.pem \
-              -o StrictHostKeyChecking=no \
+          ssh -i $HOME/ec2-deploy-key.pem \
+              -o LogLevel=DEBUG \
               ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
-          
-          set -e  # 에러 발생 시 즉시 종료
+          set -ex  # 상세 로깅 활성화
 
-          DEPLOY_DIR="/home/${{ secrets.USERNAME }}/deploy"
-          LOG_FILE="$DEPLOY_DIR/app.log"
-
-          # 기존 프로세스 안전 종료
-          if [ -f "$DEPLOY_DIR/spring-app.jar" ]; then
-            CURRENT_PID=$(pgrep -f spring-app.jar || echo "")
-            if [ -n "$CURRENT_PID" ]; then
-              kill -15 $CURRENT_PID
-              echo "Sending SIGTERM to PID: $CURRENT_PID"
-              timeout 30 tail --pid=$CURRENT_PID -f /dev/null || true  # 최대 30초 대기
-            fi
+          # 1. 기존 프로세스 종료
+          if pgrep -f spring-app.jar; then
+            pkill -15 -f spring-app.jar
+            sleep 15
+            pgrep -f spring-app.jar && pkill -9 -f spring-app.jar
           fi
 
-          # 이중 실행 방지 및 로그 백업
-          pkill -9 -f spring-app.jar || true
-          mv "$LOG_FILE" "$LOG_FILE.bak" 2>/dev/null || true
+          # 2. 로그 백업 (최대 5개 유지)
+          ls -t $EC2_DEPLOY_DIR/app.log.* 2>/dev/null | tail -n +5 | xargs rm -f
+          mv $EC2_DEPLOY_DIR/app.log $EC2_DEPLOY_DIR/app.log.$(date +%Y%m%d%H%M%S) 2>/dev/null || true
 
-          # 새 버전 배포
-          nohup java -jar "$DEPLOY_DIR/spring-app.jar" > "$LOG_FILE" 2>&1 &
+          # 3. 애플리케이션 실행
+          nohup java -jar $EC2_DEPLOY_DIR/spring-app.jar > $EC2_DEPLOY_DIR/app.log 2>&1 &
 
-          # 헬스 체크 강화 (최대 60초 대기)
-          HEALTH_CHECK_TIMEOUT=60
-          HEALTH_CHECK_INTERVAL=5
-          ATTEMPTS=$((HEALTH_CHECK_TIMEOUT / HEALTH_CHECK_INTERVAL))
+          # 4. 헬스 체크 (3분 타임아웃)
+          timeout 180 bash -c '
+            until curl -sSf http://localhost:8080/actuator/health; do
+              echo "Waiting for application..."
+              sleep 10
+            done
+          ' || (tail -n 100 $EC2_DEPLOY_DIR/app.log && exit 1)
 
-          for ((i=1; i<=ATTEMPTS; i++)); do
-            if curl -sSf http://localhost:8080/actuator/health; then
-              echo "Health check passed!"
-              break
-            fi
-            sleep $HEALTH_CHECK_INTERVAL
-          done
-
-          if [ $i -gt $ATTEMPTS ]; then
-            echo "Health check failed after $HEALTH_CHECK_TIMEOUT seconds"
-            tail -n 100 "$LOG_FILE"
-            exit 1
-          fi
-
-          # 로그 확인 (최근 50줄 출력)
-          tail -n 50 "$LOG_FILE"
-          
+          # 5. 최종 상태 확인
+          ps aux | grep java
+          curl -s http://localhost:8080/actuator/health
           EOF
 
-      - name: Cleanup SSH Key and Known Hosts
+      - name: Post Cleanup
         run: |
-          rm -f deploy-key.pem
+          rm -f $HOME/ec2-deploy-key.pem
           rm -rf ~/.ssh/
