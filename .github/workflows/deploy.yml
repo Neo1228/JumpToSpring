@@ -19,11 +19,10 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x ./gradlew
-
       - name: Build with Gradle
-        run: ./gradlew clean build
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean build
 
       - name: Copy JAR file to remote server
         uses: appleboy/scp-action@master
@@ -32,20 +31,19 @@ jobs:
           username: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
           port: 22
-          source: "build/libs/*.jar"
-          target: "/home/${{ secrets.USERNAME }}"
-          strip_components: 2
+          source: "build/libs/spring-app.jar"
+          target: "/home/${{ secrets.USERNAME }}/deploy/"
+          rm: true
 
       - name: Deploy application
         uses: fifsky/ssh-action@master
         with:
           command: |
-            pkill -f 'java' || true
-            cd /home/${{ secrets.USERNAME }}
-            ls -la
+            cd /home/${{ secrets.USERNAME }}/deploy
+            pkill -f 'spring-app.jar' || true
             nohup java -jar spring-app.jar > app.log 2>&1 &
-            sleep 10
-            ps aux | grep java
+            sleep 5
+            curl -s http://localhost:8080/actuator/health || exit 1
           host: ${{ secrets.HOST }}
           user: ${{ secrets.USERNAME }}
           key: ${{ secrets.SSH_KEY }}
