@@ -1,4 +1,4 @@
-name: Secure EC2 Deployment with Debugging
+name: Secure EC2 Deployment (Amazon Linux)
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
       - master
 
 env:
+  EC2_SSH_PORT: 2222  # SSH 포트 변경 반영
   EC2_DEPLOY_DIR: /home/${{ secrets.USERNAME }}/deploy
   EC2_LOG_FILE: app.log
 
@@ -30,80 +31,62 @@ jobs:
 
       - name: Prepare SSH Environment
         run: |
-          # 절대 경로로 키 파일 저장 (중요!)
           KEY_PATH="$HOME/ec2-deploy-key.pem"
           echo "${{ secrets.SSH_KEY }}" | base64 -d > $KEY_PATH
-
-          # 권한 강제 설정 (600 미만 시 실패)
           chmod 600 $KEY_PATH
-          if [ $(stat -c %a $KEY_PATH) -ne 600 ]; then
-            echo "::error::Key permissions invalid: $(stat -c %a $KEY_PATH)"
+
+          # SSH 포트 2222에 대한 known_hosts 등록
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -H ${{ secrets.HOST }} -p ${{ env.EC2_SSH_PORT }} >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          # 키 검증 (Amazon Linux 2 호환성 확인)
+          if ! ssh-keygen -y -f $KEY_PATH >/dev/null; then
+            echo "::error::SSH Key validation failed"
             exit 1
           fi
 
-          # 키 유효성 검증 (RSA 키 형식 확인)
-          ssh-keygen -y -f $KEY_PATH >/dev/null || (echo "::error::Invalid SSH key"; exit 1)
-
-          # SSH 설정
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-
-      - name: Debug Info
-        run: |
-          echo "### Current User ###"
-          whoami
-          echo "### Home Directory ###"
-          echo $HOME
-          echo "### Key File Permissions ###"
-          ls -l $HOME/ec2-deploy-key.pem
-          echo "### Java Version ###"
-          java -version
-
-      - name: Transfer JAR
+      - name: Transfer JAR via SCP
         run: |
           scp -i $HOME/ec2-deploy-key.pem \
+              -P ${{ env.EC2_SSH_PORT }} \  # SCP 포트 지정
               -o ConnectTimeout=30 \
-              -o LogLevel=DEBUG \
               build/libs/spring-app.jar \
               ${{ secrets.USERNAME }}@${{ secrets.HOST }}:${{ env.EC2_DEPLOY_DIR }}/
 
       - name: Deploy Application
         run: |
           ssh -i $HOME/ec2-deploy-key.pem \
-              -o LogLevel=DEBUG \
+              -p ${{ env.EC2_SSH_PORT }} \  # SSH 포트 지정
               ${{ secrets.USERNAME }}@${{ secrets.HOST }} << 'EOF'
-          set -ex  # 상세 로깅 활성화
+          set -ex
 
-          # 1. 기존 프로세스 종료
-          if pgrep -f spring-app.jar; then
-            pkill -15 -f spring-app.jar
-            sleep 15
-            pgrep -f spring-app.jar && pkill -9 -f spring-app.jar
-          fi
+          # 프로세스 관리 개선 (Amazon Linux systemd 호환)
+          sudo systemctl stop spring-app.service || true
+          sleep 5
 
-          # 2. 로그 백업 (최대 5개 유지)
+          # 로그 관리 (기존 설정 유지)
           ls -t $EC2_DEPLOY_DIR/app.log.* 2>/dev/null | tail -n +5 | xargs rm -f
           mv $EC2_DEPLOY_DIR/app.log $EC2_DEPLOY_DIR/app.log.$(date +%Y%m%d%H%M%S) 2>/dev/null || true
 
-          # 3. 애플리케이션 실행
+          # Swap 메모리 활성화 (t2.micro 최적화)
+          sudo swapon /swapfile
+
+          # 애플리케이션 실행
           nohup java -jar $EC2_DEPLOY_DIR/spring-app.jar > $EC2_DEPLOY_DIR/app.log 2>&1 &
 
-          # 4. 헬스 체크 (3분 타임아웃)
-          timeout 180 bash -c '
-            until curl -sSf http://localhost:8080/actuator/health; do
-              echo "Waiting for application..."
+          # 헬스 체크 강화
+          timeout 120 bash -c '
+            until curl -sSf http://localhost:8080/actuator/health >/dev/null; do
               sleep 10
             done
           ' || (tail -n 100 $EC2_DEPLOY_DIR/app.log && exit 1)
 
-          # 5. 최종 상태 확인
-          ps aux | grep java
-          curl -s http://localhost:8080/actuator/health
+          echo "Deployment successful!"
           EOF
 
-      - name: Post Cleanup
+      - name: Cleanup
         run: |
           rm -f $HOME/ec2-deploy-key.pem
           rm -rf ~/.ssh/
